@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Proyecto: Radiación UV Norte Grande de Chile (Open-Meteo, con fallback past_days)
+# Proyecto: Radiación UV Norte Grande de Chile (Open-Meteo, con fallback + merge past_days)
 # + Indicadores de Cobre desde mindicador.cl (USD/libra) y conversión a CLP/libra
 
 import streamlit as st
@@ -39,60 +39,111 @@ def _safe_json_get(url: str, params: dict | None = None, timeout: int = 60):
     except Exception as e:
         return {}, f"{type(e).__name__}: {e}"
 
+def _uv_json_to_df(d: dict) -> pd.DataFrame:
+    """Convierte respuesta Open-Meteo (daily) -> DataFrame ordenado ascendente."""
+    if not d or "daily" not in d or "time" not in d["daily"]:
+        return pd.DataFrame()
+    daily = d["daily"]
+    df = pd.DataFrame({
+        "date": pd.to_datetime(daily["time"]),
+        "uv_index_max": pd.to_numeric(daily.get("uv_index_max", []), errors="coerce"),
+    }).dropna(subset=["uv_index_max"])
+    return df.sort_values("date").reset_index(drop=True)
+
 # -----------------------------
-# HISTÓRICO DIARIO UVI (archive -> fallback forecast+past_days)
+# HISTÓRICO DIARIO UVI (archive -> merge con forecast past_days<=92 si falta)
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def fetch_uv_daily_smart(lat: float, lon: float, start: date, end: date):
-    """Primero intenta el endpoint 'archive'. Si viene vacío, usa 'forecast' con 'past_days'."""
-    # --- 1) Intento: ARCHIVE ---
+    """
+    1) Intenta 'archive' para el rango solicitado.
+    2) Si archive viene vacío o incompleto, usa 'forecast?past_days<=92' para completar
+       SOLO los días faltantes hasta 'end' y fusiona sin duplicados.
+    Devuelve: (df, error, meta_dict)
+    meta_dict['source'] ∈ {'archive', 'forecast(past_days=N)', 'archive+forecast(past_days=N)', 'empty', 'none'}
+    """
+    # Sanitizar fechas (y evitar pedir hoy en archive)
+    if start > end:
+        start, end = end, start
+    end_eff = min(end, date.today() - timedelta(days=1))
+
+    # --- 1) ARCHIVE ---
     url_arch = "https://archive-api.open-meteo.com/v1/archive"
     p_arch = {
-        "latitude": lat, "longitude": lon,
+        "latitude": lat,
+        "longitude": lon,
         "start_date": start.strftime("%Y-%m-%d"),
-        "end_date": end.strftime("%Y-%m-%d"),
+        "end_date": end_eff.strftime("%Y-%m-%d"),
         "daily": "uv_index_max",
         "timezone": "auto",
     }
     data_arch, err_arch = _safe_json_get(url_arch, p_arch)
+    df_arch = _uv_json_to_df(data_arch)
 
-    def _to_df(d):
-        if not d or "daily" not in d or "time" not in d["daily"]:
-            return pd.DataFrame()
-        daily = d["daily"]
-        df = pd.DataFrame({
-            "date": pd.to_datetime(daily["time"]),
-            "uv_index_max": pd.to_numeric(daily.get("uv_index_max", []), errors="coerce"),
-        }).dropna(subset=["uv_index_max"])
-        return df.sort_values("date").reset_index(drop=True)
-
-    df_arch = _to_df(data_arch)
+    # Si archive ya cubre el rango: devolver
     if not df_arch.empty:
-        return df_arch, None, {"source": "archive"}
+        # ¿Última fecha disponible en archive?
+        last_arch_date = df_arch["date"].dt.date.max()
+        # Si archive cubre hasta end_eff, no hace falta forecast
+        if last_arch_date >= end_eff:
+            mask = (df_arch["date"].dt.date >= start) & (df_arch["date"].dt.date <= end_eff)
+            return df_arch.loc[mask].reset_index(drop=True), None, {"source": "archive"}
 
-    # --- 2) Fallback: FORECAST con past_days ---
-    past_days = max((end - start).days + 1, 1)
+        # --- 2) Completar con FORECAST sólo el tramo faltante ---
+        needed_from = (last_arch_date + timedelta(days=1)) if pd.notnull(last_arch_date) else start
+        # Past_days máximo 92 y suficiente para cubrir desde needed_from hasta end_eff
+        days_needed = (end_eff - needed_from).days + 1
+        past_days = max(1, min(92, days_needed))
+        url_fc = "https://api.open-meteo.com/v1/forecast"
+        p_fc = {
+            "latitude": lat,
+            "longitude": lon,
+            "daily": "uv_index_max",
+            "timezone": "auto",
+            "past_days": past_days,
+            "forecast_days": 1,
+        }
+        data_fc, err_fc = _safe_json_get(url_fc, p_fc)
+        df_fc = _uv_json_to_df(data_fc)
+
+        if err_fc:
+            # Si forecast falló, al menos devuelve lo que hubo en archive
+            mask_arch = (df_arch["date"].dt.date >= start) & (df_arch["date"].dt.date <= end_eff)
+            return df_arch.loc[mask_arch].reset_index(drop=True), f"Forecast fallback falló: {err_fc}", {"source": "archive"}
+
+        if df_fc.empty:
+            mask_arch = (df_arch["date"].dt.date >= start) & (df_arch["date"].dt.date <= end_eff)
+            return df_arch.loc[mask_arch].reset_index(drop=True), None, {"source": "archive"}
+
+        # Fusionar: archive + forecast (sólo tramo faltante)
+        mask_fc = (df_fc["date"].dt.date >= needed_from) & (df_fc["date"].dt.date <= end_eff)
+        df_merge = pd.concat([df_arch, df_fc.loc[mask_fc]], ignore_index=True)
+        df_merge = df_merge.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+        mask_out = (df_merge["date"].dt.date >= start) & (df_merge["date"].dt.date <= end_eff)
+        return df_merge.loc[mask_out].reset_index(drop=True), None, {"source": f"archive+forecast(past_days={past_days})"}
+
+    # --- 3) Si archive venía vacío: usar solo FORECAST con cap 92 ---
+    days_req = (end_eff - start).days + 1
+    past_days = max(1, min(92, days_req))
     url_fc = "https://api.open-meteo.com/v1/forecast"
     p_fc = {
-        "latitude": lat, "longitude": lon,
+        "latitude": lat,
+        "longitude": lon,
         "daily": "uv_index_max",
         "timezone": "auto",
         "past_days": past_days,
         "forecast_days": 1,
     }
     data_fc, err_fc = _safe_json_get(url_fc, p_fc)
-    if err_fc and not err_arch:
-        # Si falló forecast, al menos devuelve el error
-        return pd.DataFrame(), f"Error consultando datos: {err_fc}", {"source": "none"}
+    if err_fc:
+        return pd.DataFrame(), f"Error consultando forecast: {err_fc}", {"source": "none"}
 
-    df_fc = _to_df(data_fc)
-    if not df_fc.empty:
-        mask = (df_fc["date"].dt.date >= start) & (df_fc["date"].dt.date <= end)
-        df_fc = df_fc.loc[mask]
-    if not df_fc.empty:
-        return df_fc, None, {"source": "forecast(past_days)"}
+    df_fc = _uv_json_to_df(data_fc)
+    if df_fc.empty:
+        return pd.DataFrame(), "Sin datos de UVI para el rango/ubicación.", {"source": "empty"}
 
-    return pd.DataFrame(), "Sin datos de UVI para el rango/ubicación.", {"source": "empty"}
+    mask_fc = (df_fc["date"].dt.date >= start) & (df_fc["date"].dt.date <= end_eff)
+    return df_fc.loc[mask_fc].reset_index(drop=True), None, {"source": f"forecast(past_days={past_days})"}
 
 # -----------------------------
 # PRONÓSTICO HORARIO UVI
@@ -189,7 +240,7 @@ def clip_by_date(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
 # UI
 # =============================
 st.title("☀️ Radiación UV – Norte Grande de Chile")
-st.caption("Índice UV histórico (con fallback) y pronóstico basado en Open-Meteo. • Incluye panel de Cobre (libra).")
+st.caption("Índice UV histórico (merge archive+forecast con cap de 92 días) y pronóstico basado en Open-Meteo. • Incluye panel de Cobre (libra).")
 
 # ----- Sidebar -----
 with st.sidebar:
@@ -213,11 +264,23 @@ if inicio >= fin:
 
 st.caption(f"⏳ Consultando histórico **{inicio} → {fin}** en **{ciudad}** (hasta ayer: {ayer}).")
 
-# ----- Descarga UVI -----
+# =============================
+# Descarga UVI (FORZAR 6 MESES)
+# =============================
 lat, lon = NORTE_GRANDE_CITIES[ciudad]
-hist, err1, dbg = fetch_uv_daily_smart(lat, lon, inicio, fin)
+
+# Ventana fija de 6 meses hacia atrás desde 'fin'
+UV_WINDOW_DAYS = 180
+uv_start_6m = fin - timedelta(days=UV_WINDOW_DAYS)
+
+# Pedimos a la API solo esos 6 meses (optimiza y asegura el recorte) con merge seguro
+hist, err1, dbg = fetch_uv_daily_smart(lat, lon, uv_start_6m, fin)
 pron, err2 = fetch_uv_forecast_hourly(lat, lon, dias)
-st.caption(f"🛰️ Fuente de histórico usada: **{dbg.get('source')}**")
+
+st.caption(
+    f"🛰️ Fuente histórico UVI: **{dbg.get('source')}** • "
+    f"UVI limitado a **{uv_start_6m} → {fin}** (últimos {UV_WINDOW_DAYS} días)."
+)
 
 # =============================
 # Histórico UVI
@@ -226,7 +289,7 @@ st.subheader(f"📈 Diario Histórico UVI – {ciudad}")
 if err1:
     st.error(err1)
 elif hist.empty:
-    st.warning("⚠️ Sin datos históricos en este rango. Prueba ampliar el período o cambiar de ciudad.")
+    st.warning("⚠️ Sin datos históricos en este rango. Prueba cambiar de ciudad.")
 else:
     chart_hist = (
         alt.Chart(hist)
@@ -236,11 +299,11 @@ else:
             y=alt.Y("uv_index_max:Q", title="Índice UV máx"),
             tooltip=["date:T", alt.Tooltip("uv_index_max:Q", title="UVI máx")]
         )
-        .properties(height=320, title=f"Histórico UVI – {ciudad}")
+        .properties(height=320, title=f"Histórico UVI – {ciudad} (últimos 6 meses)")
     )
     st.altair_chart(chart_hist, use_container_width=True)
 
-    st.markdown("**🌟 Top 5 días con mayor UVI**")
+    st.markdown("**🌟 Top 5 días con mayor UVI (últimos 6 meses)**")
     top5 = compute_top_days(hist, 5)
     if top5.empty:
         st.info("No hay suficientes datos para calcular el Top 5.")
